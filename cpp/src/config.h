@@ -48,4 +48,10 @@ void RevealFile();
 bool AutoStartEnabled();
 void SetAutoStart(bool enable);
 
+/// Global "show desktop" hotkey, stored as a human-readable combination
+/// such as "Ctrl+Alt+D". The main window parses it and registers it with
+/// RegisterHotKey; the tray menu's hotkey dialog updates it.
+const std::wstring& ShowDesktopHotkey();
+void SetShowDesktopHotkey(const std::wstring& combo);
+
 } // namespace Config

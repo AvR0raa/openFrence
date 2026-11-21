@@ -32,6 +32,7 @@ add_executable(openfences
     src/menu_icons.cpp
     src/config.cpp
     src/explorer_sort.cpp
+    src/zoom_overlay.cpp
     src/app.rc
 )
 
@@ -57,11 +58,40 @@ endif()
 target_link_libraries(openfences PRIVATE
     d2d1 dwrite windowscodecs
     ole32 shlwapi shell32 comctl32 comdlg32
-    advapi32
+    advapi32 dwmapi
     nlohmann_json::nlohmann_json
 )
 
 set_target_properties(openfences PROPERTIES WIN32_EXECUTABLE TRUE)
+
+
+# Zoom self-test: compiled as a DLL so it can be run through the signed
+# rundll32.exe host (an unsigned standalone test exe trips SmartScreen on
+# this machine). Drives the real FenceWindow zoom state machine under a
+# hidden host window; see src/zoom_selftest.cpp.
+add_library(zoom_selftest SHARED EXCLUDE_FROM_ALL
+    src/zoom_selftest.cpp
+    src/fence_window.cpp
+    src/render.cpp
+    src/settings_panel.cpp
+    src/context_menu.cpp
+    src/icon_extract.cpp
+    src/menu_icons.cpp
+    src/config.cpp
+    src/explorer_sort.cpp
+    src/zoom_overlay.cpp
+)
+target_include_directories(zoom_selftest PRIVATE src)
+if(NOT EXISTS "${_msvc_root}/atlmfc/include/atlbase.h")
+    target_include_directories(zoom_selftest PRIVATE atlcompat)
+endif()
+target_link_libraries(zoom_selftest PRIVATE
+    d2d1 dwrite windowscodecs
+    ole32 shlwapi shell32 comctl32 comdlg32
+    advapi32
+    nlohmann_json::nlohmann_json
+)
+set_target_properties(zoom_selftest PROPERTIES PREFIX "" OUTPUT_NAME "zoom_selftest")
 
 add_executable(diag desktop_diag.cpp)
 target_link_libraries(diag PRIVATE user32 comctl32)

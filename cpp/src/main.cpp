@@ -5,13 +5,78 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shlguid.h>
+#include <shldisp.h>    // IShellDispatch4::ToggleDesktop (show desktop)
 #include <commctrl.h>
 #include "render.h"
 #include "fence_window.h"
 #include "context_menu.h"
 #include "menu_icons.h"
 #include "config.h"
+#include "zoom_overlay.h"
 #include "resource.h"
+#include <cstdio>
+#include <atomic>
+#include <cstdlib>
+#include <cwchar>
+#include <cwctype>
+
+// TEMP startup diagnostic — remove once the 0xc0000374 crash is located.
+static void StartupLog(const wchar_t* msg);
+
+static void LogProcessContext() {
+    BOOL elevated = FALSE;
+    HANDLE tok = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &tok)) {
+        TOKEN_ELEVATION te = {};
+        DWORD cb = sizeof(te);
+        GetTokenInformation(tok, TokenElevation, &te, cb, &cb);
+        elevated = te.TokenIsElevated;
+        CloseHandle(tok);
+    }
+    DWORD il = 0;
+    {
+        BYTE buf[256] = {};
+        DWORD cb = sizeof(buf);
+        HANDLE itok = nullptr;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &itok)) {
+            if (GetTokenInformation(itok, TokenIntegrityLevel, buf, cb, &cb)) {
+                auto* label = (TOKEN_MANDATORY_LABEL*)buf;
+                DWORD cnt = *GetSidSubAuthorityCount(label->Label.Sid);
+                il = *GetSidSubAuthority(label->Label.Sid, cnt - 1);
+            }
+            CloseHandle(itok);
+        }
+    }
+    DWORD session = 0;
+    ProcessIdToSessionId(GetCurrentProcessId(), &session);
+    wchar_t wsta[128] = {};
+    DWORD wn = 0;
+    GetUserObjectInformationW(GetProcessWindowStation(), UOI_NAME,
+                              wsta, sizeof(wsta), &wn);
+    wchar_t deskName[128] = {};
+    HDESK desk = GetThreadDesktop(GetCurrentThreadId());
+    if (desk) GetUserObjectInformationW(desk, UOI_NAME, deskName,
+                                        sizeof(deskName), &wn);
+    wchar_t buf[512];
+    swprintf_s(buf, L"context elevated=%d il=0x%lx session=%lu winsta=%s desk=%s",
+               elevated ? 1 : 0, il, session, wsta, deskName);
+    StartupLog(buf);
+}
+
+static void StartupLog(const wchar_t* msg) {
+    static const bool enabled = [] {
+        wchar_t b[8] = {};
+        return GetEnvironmentVariableW(L"OPENFENCES_DIAG", b, 8) > 0;
+    }();
+    if (!enabled) return;
+    wchar_t appdata[MAX_PATH] = {};
+    if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) return;
+    std::wstring dir = std::wstring(appdata) + L"\\openFences";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring p = dir + L"\\startup.log";
+    FILE* f = _wfopen(p.c_str(), L"a, ccs=UTF-8");
+    if (f) { fwprintf(f, L"%lu %s\r\n", GetTickCount(), msg); fclose(f); }
+}
 #include <vector>
 #include <memory>
 #include <algorithm>
@@ -74,11 +139,16 @@ static void ReparentFence(HWND fence, HWND newParent) {
     if (GetParent(fence) == newParent) return;
     RECT rc;
     if (!GetWindowRect(fence, &rc)) return;
-    if (!SetParent(fence, newParent)) return;
+    wchar_t buf[256];
+    swprintf_s(buf, L"reparent %p -> %p", fence, newParent);
+    StartupLog(buf);
+    if (!SetParent(fence, newParent)) { StartupLog(L"reparent SetParent FAILED"); return; }
+    StartupLog(L"reparent SetParent ok");
     POINT p{ rc.left, rc.top };
     ScreenToClient(newParent, &p);
     SetWindowPos(fence, HWND_TOP, p.x, p.y, rc.right - rc.left, rc.bottom - rc.top,
                  SWP_NOACTIVATE);
+    StartupLog(L"reparent SetWindowPos ok");
 }
 
 void ScanAndConstrainIcons() {
@@ -174,11 +244,16 @@ void ToggleDesktopIcons() {
 // no-ops (parents match, the list is already hidden).
 static void ApplyDesktopIconsHidden() {
     if (!g_deskHidden) return;
+    static int applyLogs = 0;
+    const bool logThis = applyLogs++ < 5;
+    if (logThis) StartupLog(L"ApplyDesktopIconsHidden enter");
     HWND lv = FindDesktopLV();
     HWND defview = lv ? GetParent(lv) : nullptr;
-    if (!lv || !defview) return;   // desktop not up yet; retry on next tick
+    if (!lv || !defview) { if (logThis) StartupLog(L"Apply: no lv/defview"); return; }
     for (auto& f : g_fences) ReparentFence(f->Hwnd(), defview);
+    if (logThis) StartupLog(L"Apply: fences reparented, hiding list");
     ShowWindow(lv, SW_HIDE);
+    if (logThis) StartupLog(L"Apply: list hidden");
 }
 
 // Explorer's own "Show desktop icons" switch (desktop context menu → View)
@@ -198,13 +273,17 @@ static void WatchDesktopIconVisibility() {
     if (!lv) return;
     bool shown = IsWindowVisible(lv) != FALSE;
     if (!shown && !g_extParked) {
+        StartupLog(L"Watch: external hide, parking");
         HWND defview = GetParent(lv);
         if (!defview) return;
         for (auto& f : g_fences) ReparentFence(f->Hwnd(), defview);
         g_extParked = true;
+        StartupLog(L"Watch: parked");
     } else if (shown && g_extParked) {
+        StartupLog(L"Watch: list back, unparking");
         for (auto& f : g_fences) ReparentFence(f->Hwnd(), lv);
         g_extParked = false;
+        StartupLog(L"Watch: unparked");
     }
 }
 
@@ -228,6 +307,328 @@ static void CreateDesktopShortcut() {
         pf->Release();
     }
     sl->Release();
+}
+
+// ── Show desktop hotkey ──
+
+static bool ParseHotkey(const std::wstring& combo, UINT& mods, UINT& vk) {
+    mods = 0;
+    vk = 0;
+    std::wstring token;
+    auto flush = [&]() -> bool {
+        if (token.empty()) return false;
+        bool ok = true;
+        if (token == L"CTRL" || token == L"CONTROL") mods |= MOD_CONTROL;
+        else if (token == L"ALT") mods |= MOD_ALT;
+        else if (token == L"SHIFT") mods |= MOD_SHIFT;
+        else if (token == L"WIN" || token == L"WINDOWS") mods |= MOD_WIN;
+        else if (vk != 0) ok = false;
+        else if (token.size() == 1 && iswalnum(token[0])) vk = (UINT)towupper(token[0]);
+        else if (token.size() >= 2 && token[0] == L'F') {
+            int n = _wtoi(token.c_str() + 1);
+            if (n >= 1 && n <= 24) vk = VK_F1 + n - 1;
+            else ok = false;
+        } else if (token == L"SPACE") vk = VK_SPACE;
+        else if (token == L"TAB") vk = VK_TAB;
+        else if (token == L"ENTER") vk = VK_RETURN;
+        else if (token == L"ESC" || token == L"ESCAPE") vk = VK_ESCAPE;
+        else if (token == L"HOME") vk = VK_HOME;
+        else if (token == L"END") vk = VK_END;
+        else if (token == L"INSERT") vk = VK_INSERT;
+        else if (token == L"DELETE") vk = VK_DELETE;
+        else if (token == L"LEFT") vk = VK_LEFT;
+        else if (token == L"RIGHT") vk = VK_RIGHT;
+        else if (token == L"UP") vk = VK_UP;
+        else if (token == L"DOWN") vk = VK_DOWN;
+        else if (token == L"PAGEUP") vk = VK_PRIOR;
+        else if (token == L"PAGEDOWN") vk = VK_NEXT;
+        else ok = false;
+        token.clear();
+        return ok;
+    };
+
+    for (size_t i = 0; i <= combo.size(); i++) {
+        wchar_t c = (i < combo.size()) ? combo[i] : L'+';
+        if (c == L'+') {
+            if (!flush()) return false;
+        } else if (!iswspace(c)) {
+            token.push_back((wchar_t)towupper(c));
+        }
+    }
+    return vk != 0;
+}
+
+static std::wstring FormatHotkey(UINT mods, UINT vk) {
+    std::wstring out;
+    auto add = [&](const wchar_t* part) {
+        if (!out.empty()) out += L"+";
+        out += part;
+    };
+    if (mods & MOD_CONTROL) add(L"Ctrl");
+    if (mods & MOD_ALT)     add(L"Alt");
+    if (mods & MOD_SHIFT)   add(L"Shift");
+    if (mods & MOD_WIN)     add(L"Win");
+
+    wchar_t key[16] = {};
+    if (vk >= 'A' && vk <= 'Z')       key[0] = (wchar_t)vk;
+    else if (vk >= '0' && vk <= '9')  key[0] = (wchar_t)vk;
+    else if (vk >= VK_F1 && vk <= VK_F24)
+        swprintf_s(key, L"F%u", vk - VK_F1 + 1);
+    else {
+        switch (vk) {
+        case VK_SPACE:  wcscpy_s(key, L"Space"); break;
+        case VK_TAB:    wcscpy_s(key, L"Tab"); break;
+        case VK_RETURN: wcscpy_s(key, L"Enter"); break;
+        case VK_ESCAPE: wcscpy_s(key, L"Esc"); break;
+        case VK_HOME:   wcscpy_s(key, L"Home"); break;
+        case VK_END:    wcscpy_s(key, L"End"); break;
+        case VK_INSERT: wcscpy_s(key, L"Insert"); break;
+        case VK_DELETE: wcscpy_s(key, L"Delete"); break;
+        case VK_LEFT:   wcscpy_s(key, L"Left"); break;
+        case VK_RIGHT:  wcscpy_s(key, L"Right"); break;
+        case VK_UP:     wcscpy_s(key, L"Up"); break;
+        case VK_DOWN:   wcscpy_s(key, L"Down"); break;
+        case VK_PRIOR:  wcscpy_s(key, L"PageUp"); break;
+        case VK_NEXT:   wcscpy_s(key, L"PageDown"); break;
+        default:        swprintf_s(key, L"0x%02X", vk); break;
+        }
+    }
+    if (key[0]) add(key);
+    return out;
+}
+
+static std::wstring CurrentHotkeyText() {
+    UINT mods = 0, vk = 0;
+    if (ParseHotkey(Config::ShowDesktopHotkey(), mods, vk))
+        return FormatHotkey(mods, vk);
+    return Config::ShowDesktopHotkey();
+}
+
+static void ShowDesktop() {
+    // IShellDispatch4::ToggleDesktop is the taskbar Show Desktop button's own
+    // code path. Unlike synthesizing Win+D, it does not care that the user is
+    // still holding Ctrl/Alt from the shortcut key chord.
+    CComPtr<IShellDispatch4> shell;
+    HRESULT hr = CoCreateInstance(CLSID_Shell, nullptr, CLSCTX_ALL,
+                                  IID_IShellDispatch4, (void**)&shell);
+    if (SUCCEEDED(hr) && shell) {
+        HRESULT th = shell->ToggleDesktop();
+        // S_FALSE means the shell accepted the call but did not change the
+        // desktop (it can happen while the shortcut chord is still held).
+        // Fall through to the modifier-release + Win+D path in that case.
+        if (th == S_OK) return;
+    }
+    // Last-resort fallback: release the chord's modifiers, then Win+D.
+    keybd_event(VK_CONTROL, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_SHIFT, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN, 0, 0, 0);
+    keybd_event('D', 0, 0, 0);
+    keybd_event('D', 0, KEYEVENTF_KEYUP, 0);
+    keybd_event(VK_LWIN, 0, KEYEVENTF_KEYUP, 0);
+}
+
+// Low-level keyboard hook for the configurable shortcut. RegisterHotKey is
+// unreliable here (the combination can be owned by the shell or another app,
+// and some systems never deliver the WM_HOTKEY for it). The LL hook sees the
+// physical/injected key before any other handler and is independent of the
+// registration table.
+static HHOOK g_showHotkeyHook = nullptr;
+static HANDLE g_showHotkeyThread = nullptr;
+static std::atomic<UINT> g_showHotMods{0};
+static std::atomic<UINT> g_showHotVk{0};
+static std::atomic<bool> g_showHotDown{false};
+static std::atomic<bool> g_showHotSuspend{false};
+// Modifier state is tracked in the hook thread. GetAsyncKeyState can be
+// unreliable there (the hook thread has no foreground input queue), which
+// made a perfectly received chord fail the modifier match.
+static bool g_hookCtrl = false, g_hookAlt = false;
+static bool g_hookShift = false, g_hookWin = false;
+constexpr UINT WM_APP_SHOW_DESKTOP = WM_APP + 0x60;
+
+static void RefreshShowHotkeyBinding() {
+    UINT mods = 0, vk = 0;
+    if (ParseHotkey(Config::ShowDesktopHotkey(), mods, vk)) {
+        g_showHotMods.store(mods);
+        g_showHotVk.store(vk);
+    } else {
+        g_showHotMods.store(0);
+        g_showHotVk.store(0);
+    }
+    g_showHotDown.store(false);
+}
+
+static LRESULT CALLBACK ShowHotkeyKeyboardProc(int code, WPARAM wp, LPARAM lp) {
+    UINT vk = g_showHotVk.load();
+    UINT mods = g_showHotMods.load();
+    if (code == HC_ACTION) {
+        const KBDLLHOOKSTRUCT* kb = (const KBDLLHOOKSTRUCT*)lp;
+        const bool down = (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN);
+        const bool up = (wp == WM_KEYUP || wp == WM_SYSKEYUP);
+        if (down || up) {
+            switch (kb->vkCode) {
+            case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL: g_hookCtrl = down; break;
+            case VK_MENU:    case VK_LMENU:    case VK_RMENU:    g_hookAlt = down; break;
+            case VK_SHIFT:   case VK_LSHIFT:   case VK_RSHIFT:   g_hookShift = down; break;
+            case VK_LWIN:    case VK_RWIN:                       g_hookWin = down; break;
+            default: break;
+            }
+        }
+        if (vk && !g_showHotSuspend.load() && down && kb->vkCode == vk) {
+            if (g_hookCtrl == ((mods & MOD_CONTROL) != 0) &&
+                g_hookAlt == ((mods & MOD_ALT) != 0) &&
+                g_hookShift == ((mods & MOD_SHIFT) != 0) &&
+                g_hookWin == ((mods & MOD_WIN) != 0)) {
+                if (!g_showHotDown.exchange(true))
+                    PostMessageW(g_owner, WM_APP_SHOW_DESKTOP, 0, 0);
+                return 1;   // swallow the configured chord
+            }
+        } else if (kb->vkCode == g_showHotVk.load() && up) {
+            g_showHotDown.store(false);
+        }
+    }
+    return CallNextHookEx(g_showHotkeyHook, code, wp, lp);
+}
+
+static DWORD WINAPI ShowHotkeyThreadProc(LPVOID) {
+    // A dedicated thread owns the low-level hook. Keeping it off the UI/COM
+    // thread matters: Windows silently drops a WH_KEYBOARD_LL hook whose
+    // callback is delayed past LowLevelHooksTimeout, which made the shortcut
+    // work once and then stop while ShowDesktop was still on the UI thread.
+    SetLastError(0);
+    g_showHotkeyHook = SetWindowsHookExW(WH_KEYBOARD_LL,
+        ShowHotkeyKeyboardProc, GetModuleHandleW(nullptr), 0);
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (g_showHotkeyHook) {
+        UnhookWindowsHookEx(g_showHotkeyHook);
+        g_showHotkeyHook = nullptr;
+    }
+    return 0;
+}
+
+static void InstallShowHotkeyHook() {
+    RefreshShowHotkeyBinding();
+    if (!g_showHotkeyThread) {
+        SetLastError(0);
+        g_showHotkeyThread = CreateThread(nullptr, 0, ShowHotkeyThreadProc,
+                                          nullptr, 0, nullptr);
+    }
+}
+
+static constexpr int kHotkeyCtrlId = 200;
+
+static LRESULT CALLBACK HotkeyDlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HFONT font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+        HWND label = CreateWindowExW(0, L"STATIC",
+            FenceWindow::Loc(L"Press the new Show Desktop shortcut:", L"按下新的显示桌面快捷键："),
+            WS_CHILD | WS_VISIBLE, 18, 18, 324, 22, hwnd, nullptr,
+            GetModuleHandle(nullptr), nullptr);
+        HWND hk = CreateWindowExW(0, L"msctls_hotkey32", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP, 18, 48, 324, 28, hwnd,
+            (HMENU)(INT_PTR)kHotkeyCtrlId, GetModuleHandle(nullptr), nullptr);
+        HWND ok = CreateWindowExW(0, L"BUTTON",
+            FenceWindow::Loc(L"OK", L"确定"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON,
+            176, 130, 76, 28, hwnd, (HMENU)IDOK, GetModuleHandle(nullptr), nullptr);
+        HWND cancel = CreateWindowExW(0, L"BUTTON",
+            FenceWindow::Loc(L"Cancel", L"取消"),
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+            264, 130, 78, 28, hwnd, (HMENU)IDCANCEL, GetModuleHandle(nullptr), nullptr);
+        for (HWND h : { label, hk, ok, cancel }) {
+            if (h) SendMessageW(h, WM_SETFONT, (WPARAM)font, TRUE);
+        }
+        UINT mods = 0, vk = 0;
+        ParseHotkey(Config::ShowDesktopHotkey(), mods, vk);
+        UINT flags = 0;
+        if (mods & MOD_CONTROL) flags |= HOTKEYF_CONTROL;
+        if (mods & MOD_ALT)     flags |= HOTKEYF_ALT;
+        if (mods & MOD_SHIFT)   flags |= HOTKEYF_SHIFT;
+        if (hk) {
+            SendMessageW(hk, HKM_SETHOTKEY, MAKEWORD(vk, flags), 0);
+            SetFocus(hk);
+        }
+        return 0;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK) {
+            WORD hk = (WORD)SendMessageW(GetDlgItem(hwnd, kHotkeyCtrlId),
+                                         HKM_GETHOTKEY, 0, 0);
+            UINT vk = LOBYTE(hk);
+            UINT flags = HIBYTE(hk);
+            UINT mods = 0;
+            if (flags & HOTKEYF_CONTROL) mods |= MOD_CONTROL;
+            if (flags & HOTKEYF_ALT)     mods |= MOD_ALT;
+            if (flags & HOTKEYF_SHIFT)   mods |= MOD_SHIFT;
+            if (!vk || !mods) {
+                MessageBoxW(hwnd,
+                    FenceWindow::Loc(L"Press a modifier plus a key, e.g. Ctrl+Alt+Home.",
+                                     L"请按至少一个修饰键加一个主键，例如 Ctrl+Alt+Home。"),
+                    FenceWindow::Loc(L"Show Desktop Hotkey", L"显示桌面快捷键"),
+                    MB_OK | MB_ICONINFORMATION);
+                return 0;
+            }
+            Config::SetShowDesktopHotkey(FormatHotkey(mods, vk));
+            RefreshShowHotkeyBinding();
+            Config::SaveNow();
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (LOWORD(wp) == IDCANCEL) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        break;
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowHotkeyDialog() {
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc = { sizeof(wc) };
+        wc.lpfnWndProc = HotkeyDlgProc;
+        wc.hInstance = GetModuleHandle(nullptr);
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+        wc.lpszClassName = L"OpenFencesHotkeyDlg";
+        registered = RegisterClassExW(&wc) != 0;
+    }
+    if (!registered) return;
+
+    const int w = 360, h = 200;
+    RECT wa = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    int x = (wa.right - w) / 2, y = (wa.bottom - h) / 2;
+    HWND dlg = CreateWindowExW(WS_EX_DLGMODALFRAME | WS_EX_CONTROLPARENT | WS_EX_TOOLWINDOW,
+        L"OpenFencesHotkeyDlg",
+        FenceWindow::Loc(L"Show Desktop Hotkey", L"显示桌面快捷键"),
+        WS_POPUP | WS_CAPTION | WS_SYSMENU,
+        x, y, w, h, g_owner, nullptr, GetModuleHandle(nullptr), nullptr);
+    if (!dlg) return;
+
+    g_showHotSuspend.store(true);
+    EnableWindow(g_owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    MSG msg;
+    while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) {
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    g_showHotSuspend.store(false);
+    EnableWindow(g_owner, TRUE);
+    SetForegroundWindow(g_owner);
 }
 
 void ShowTrayMenu(HWND hwnd) {
@@ -258,6 +659,15 @@ void ShowTrayMenu(HWND hwnd) {
         FenceWindow::Loc(L"Create Desktop Shortcut", L"创建桌面快捷方式"));
 
     AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    {
+        std::wstring show = FenceWindow::Loc(L"Show Desktop", L"显示桌面");
+        std::wstring hk = CurrentHotkeyText();
+        if (!hk.empty()) show += L"  " + hk;
+        AppendMenuW(menu, MF_STRING, 104, show.c_str());
+    }
+    AppendMenuW(menu, MF_STRING, 105,
+        FenceWindow::Loc(L"Set Show Desktop Hotkey...", L"设置显示桌面快捷键..."));
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu, MF_STRING, 102, FenceWindow::Loc(L"Exit", L"退出"));
 
     // Fluent glyph icons, by menu position (0 New Fence, 1 Hide/Show All
@@ -282,7 +692,9 @@ void ShowTrayMenu(HWND hwnd) {
         icon(4, MenuGlyph::Globe);
         icon(5, MenuGlyph::Rocket);
         icon(6, MenuGlyph::Folder);
-        icon(8, MenuGlyph::Power);
+        icon(9, MenuGlyph::Eye);       // Show Desktop
+        icon(10, MenuGlyph::Sliders);  // Set Show Desktop Hotkey
+        icon(12, MenuGlyph::Power);    // Exit
     }
 
     SetForegroundWindow(hwnd);
@@ -328,6 +740,10 @@ void ShowTrayMenu(HWND hwnd) {
         Config::RevealFile();
     } else if (cmd == 114) {
         CreateDesktopShortcut();
+    } else if (cmd == 104) {
+        ShowDesktop();
+    } else if (cmd == 105) {
+        ShowHotkeyDialog();
     } else if (cmd == 102) {
         Config::SaveNow();   // do not ride on the debounce for a real exit
         NOTIFYICONDATAW nid = { sizeof(NOTIFYICONDATAW), hwnd, 1 };
@@ -342,14 +758,17 @@ void ShowTrayMenu(HWND hwnd) {
 static void RebuildFences() {
     // The fences are recreated under the fresh icon list; drop the parked
     // state (the watcher re-parks on the next tick if explorer still hides
-    // the list).
+    // the list). The zoom shade died with the old tree — drop its state too.
     g_extParked = false;
+    ZoomOverlay::Close();
+    FenceWindow::SetTeardown(true);
     struct Saved { FenceData data; std::vector<IconEntry> icons; bool collapsed; };
     std::vector<Saved> saved;
     saved.reserve(g_fences.size());
     for (auto& f : g_fences)
         saved.push_back({ f->GetData(), f->Icons(), f->IsCollapsed() });
     g_fences.clear();   // dtors see the dead HWNDs and skip DestroyWindow
+    FenceWindow::SetTeardown(false);
     for (auto& s : saved) {
         auto f = std::make_unique<FenceWindow>(s.data);
         if (!s.data.sourceFolder.empty()) {
@@ -375,6 +794,10 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_HOTKEY:
         if (wp == 1) ToggleDesktopIcons();
         return 0;
+
+    case WM_APP_SHOW_DESKTOP:
+        ShowDesktop();
+        return 0;
     case WM_DISPLAYCHANGE:
     case WM_SETTINGCHANGE:
         // Resolution / personalization broadcasts only reach top-level
@@ -386,15 +809,24 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     case WM_TIMER:
         if (wp == 2) {   // desktop icon-size watcher
+            static int ticks = 0;
+            if (ticks < 5) StartupLog(L"owner tick begin");
+            ticks++;
             // Keep replaying a persisted hide until the icon list exists
             // (a Run-key boot launch can beat explorer's desktop tree).
             ApplyDesktopIconsHidden();
+            if (ticks < 5) StartupLog(L"owner tick after apply");
             // Keep fences alive across explorer's own icon hide/show.
             WatchDesktopIconVisibility();
+            if (ticks < 5) StartupLog(L"owner tick after watch");
             // One live measurement per tick, shared by all fences (the query
             // opens explorer's process — not worth repeating per fence).
             int px = QueryDesktopIconSizePx();
+            if (ticks < 5) StartupLog(L"owner tick after query");
             for (auto& f : g_fences) {
+                // A zoom animation that stalled (timer lost mid-flight)
+                // would freeze the desktop half-open — force-finish it.
+                f->ZoomStallCheck();
                 // Display topology changes move the desktop icon list; keep
                 // every fence at its saved screen position.
                 f->RestoreAnchor();
@@ -429,15 +861,24 @@ LRESULT CALLBACK OwnerWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 // ── Entry ──
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
+    StartupLog(L"wWinMain enter");
+    LogProcessContext();
     // 第二个实例会把围栏重复绘制在同一桌面上；命名互斥体保证只有一个实例
     // （进程崩溃时系统自动释放，不会留下死锁）。
     HANDLE singleInstance = CreateMutexW(nullptr, TRUE, L"openFences_SingleInstance");
-    if (!singleInstance || GetLastError() == ERROR_ALREADY_EXISTS) return 0;
+    if (!singleInstance || GetLastError() == ERROR_ALREADY_EXISTS) {
+        StartupLog(L"mutex already exists — exit");
+        return 0;
+    }
+    StartupLog(L"mutex created");
 
     EnableDpiAwareness();
+    StartupLog(L"dpi awareness");
     ComInit com;
-    InitCommonControls();
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_HOTKEY_CLASS | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
     FenceWindow::RegisterClass(hInst);
+    StartupLog(L"classes registered");
 
     WNDCLASSEXW wc = { sizeof(wc) };
     wc.lpfnWndProc = OwnerWndProc;
@@ -449,6 +890,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         0, 0, 0, 0, nullptr, nullptr, hInst, nullptr);
 
     FenceWindow::SetOwner(g_owner);
+    StartupLog(g_owner ? L"owner window created" : L"owner window FAILED");
     RegisterHotKey(g_owner, 1, MOD_CONTROL | MOD_SHIFT, 'H');
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
@@ -460,6 +902,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // Restore the persisted layout (language, fences, icons, appearance).
     // Only a missing/unreadable config falls back to the three starter
     // fences — an empty list is a valid saved state (everything deleted).
+    StartupLog(L"before Config::LoadApp");
     if (!Config::LoadApp()) {
         // Default titles follow the startup language (they are fence names,
         // set once at birth — a later language switch does not rename
@@ -475,12 +918,20 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
         for (auto& fd : fences)
             g_fences.push_back(std::make_unique<FenceWindow>(fd));
     }
+    InstallShowHotkeyHook();
 
     // Replay OUR persisted hide (config deskHidden) right away — explorer
     // reset the list to visible on its way up. When a Run-key launch beat
     // the desktop tree, the timer-2 tick keeps retrying until it exists.
-    ApplyDesktopIconsHidden();
+    StartupLog(L"after Config::LoadApp");
+    // Do NOT reparent the freshly-created fences synchronously. SetParent on
+    // a WS_EX_LAYERED child immediately after CreateWindowEx (before the
+    // message loop has drained the creation-time messages) corrupts the heap
+    // on this shell build. The 300ms owner tick replays the same hide once
+    // the fences have settled; the icons stay visible for one tick.
+    StartupLog(L"deferred ApplyDesktopIconsHidden to owner tick");
     WatchDesktopIconVisibility();
+    StartupLog(L"after WatchDesktopIconVisibility");
 
     // ScanAndConstrainIcons disabled for now — cross-process SendMessage
     // to explorer's ListView can cause deadlocks.
@@ -493,11 +944,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int) {
     // actually changed.
     SetTimer(g_owner, 2, 300, nullptr);
 
+    StartupLog(L"entering message loop");
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    FenceWindow::SetTeardown(true);   // teardown is not a zoom dismissal
     g_fences.clear();
     return 0;
 }

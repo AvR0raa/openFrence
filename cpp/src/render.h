@@ -29,6 +29,12 @@ struct ComInit {
 /// could be determined at all.
 int QueryDesktopIconSizePx();
 
+/// Downsample + acrylic blur + saturation/noise, shared by the fence's
+/// frosted backdrop and the zoom shade's pre-rendered dimmed wallpaper.
+/// Returns opaque 32bpp BGRA pixels at ~1/4 resolution (outW/outH).
+bool BuildBlurredBackdrop(const BYTE* bgrx, int w, int h,
+                          std::vector<BYTE>& out, int& outW, int& outH);
+
 struct FenceAppearance {
     // Alpha values are tuned for the frosted-glass backdrop: a lower alpha
     // lets the blurred desktop snapshot show through the panel tint.
@@ -107,15 +113,41 @@ public:
                    const RECT* marquee = nullptr,
                    bool chevronHover = false, bool chevronDown = false,
                    float scrollY = 0.0f,
-                   const FenceViewState* view = nullptr);
+                   const FenceViewState* view = nullptr,
+                   // Zoom animation: draw at an explicit logical size (the
+                   // fixed target canvas stays m_width/m_height), optionally
+                   // skipping the (target-sized) backdrop texture.
+                   bool noBackdrop = false,
+                   float drawW = -1.0f, float drawH = -1.0f);
     bool Resize(UINT w, UINT h);
     bool Present(HWND hwnd, int x, int y);
+    // Preload every icon at the CURRENT imgSize without drawing the card.
+    void WarmIcons(const std::vector<IconEntry>& icons);
+    // Present the top-left w×h of the fixed target at screen (x,y), without
+    // resizing the render target. Used by the zoom flight.
+    bool PresentCropped(HWND hwnd, int x, int y, int w, int h);
 
     /// Cheap style refresh: release and recreate only the brushes and text
     /// formats from the current FenceAppearance. The render target, DIB,
     /// WIC bitmap, icon cache and backdrop are left untouched, so this is
     /// safe to call at slider-drag frequency for live preview.
     void RebuildStyles();
+
+    /// Zoom animation snapshot: copy the current WIC pixels into a CPU
+    /// buffer so later Resize() calls (which recreate the target) can still
+    /// draw the same content, scaled, without re-extracting any icon.
+    bool CaptureSnapshot();
+    bool CapturePreviousSnapshot();   // base layout, captured before the zoom
+    void DrawSnapshot();   // between BeginDraw/EndDraw; scales the whole card
+    void DrawSnapshotBody(float srcTop, float dstTop);   // body only, title fixed
+    // Cross-fade the previous (base) body into the current (zoom) body.
+    // blend = 0 shows the base layout, 1 the zoom layout.
+    void DrawSnapshotBodyBlend(float srcTop, float dstTop, float blend);
+    void ClearSnapshots() { m_snapshot.clear(); m_snapshotPrev.clear();
+                            m_snapshot.shrink_to_fit(); m_snapshotPrev.shrink_to_fit();
+                            m_snapW = m_snapH = m_snapStride = 0;
+                            m_snapPrevW = m_snapPrevH = m_snapPrevStride = 0; }
+    bool HasSnapshot() const { return !m_snapshot.empty() || !m_snapshotPrev.empty(); }
 
     /// Adopt a new desktop icon glyph size (physical px, as measured by
     /// QueryDesktopIconSizePx) when it differs from the current one. The
@@ -145,8 +177,9 @@ private:
     bool CreateBrushes();
     bool CreateTextFormats();
     void BuildChevronPath();
-    void BuildTitleBarPaths();
+    void BuildTitleBarPaths(float w, float h);
     bool CopyWicToDib();
+    bool CopyWicRegionToPresent(int w, int h);
     bool CreateDibDC();
     void ScaleAppearance();   // grow 96-DPI design metrics to physical pixels
     ID2D1Bitmap* LoadFileIcon(const std::wstring& filePath);
@@ -195,7 +228,15 @@ private:
     HDC     m_memDC   = nullptr;
     HBITMAP m_dib     = nullptr;
     HGDIOBJ m_oldBmp  = nullptr;
+    // Reusable current-size presentation DIB for the zoom flight. Allocated
+    // at the target size once; each frame copies the top-left current region.
+    HDC     m_presentDC   = nullptr;
+    HBITMAP m_presentDib  = nullptr;
+    void*   m_presentBits = nullptr;
+    HGDIOBJ m_presentOld  = nullptr;
+    UINT    m_presentW    = 0, m_presentH = 0;
     UINT    m_width   = 0, m_height = 0;
+    float   m_pathW   = 0.0f, m_pathH = 0.0f;   // title-bar paths' size
     FenceAppearance m_app;
 
     std::unordered_map<std::wstring, CComPtr<ID2D1Bitmap>> m_iconCache;
@@ -213,4 +254,10 @@ private:
     // Search box text width (cached per text value to avoid per-frame layout).
     std::wstring m_searchTextCache;
     float m_searchTextW = 0.0f;
+
+    // Zoom animation snapshot (CPU copy of the WIC surface).
+    std::vector<BYTE> m_snapshot;
+    UINT m_snapW = 0, m_snapH = 0, m_snapStride = 0;
+    std::vector<BYTE> m_snapshotPrev;
+    UINT m_snapPrevW = 0, m_snapPrevH = 0, m_snapPrevStride = 0;
 };

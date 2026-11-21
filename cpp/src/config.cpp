@@ -6,6 +6,8 @@
 #include <vector>
 #include <memory>
 #include <cwchar>
+#include <cstdarg>
+#include <cstdio>
 
 using json = nlohmann::json;
 
@@ -16,6 +18,33 @@ extern bool g_deskHidden;   // tray "hide desktop icons" toggle; replayed by
                             // main.cpp's ApplyDesktopIconsHidden on startup
 
 namespace {
+
+// Configurable global "show desktop" accelerator. Stored in the JSON as a
+// readable string so users can also edit it by hand.
+static std::wstring g_showDesktopHotkey = L"Ctrl+Alt+Home";
+
+// TEMP load diagnostic — remove once the 0xc0000374 crash is located.
+static void LoadLog(const wchar_t* fmt, ...) {
+    wchar_t path[MAX_PATH] = {};
+    DWORD n = GetEnvironmentVariableW(L"OPENFENCES_TEST_LOG", path, MAX_PATH);
+    if (!n) {
+        wchar_t diag[8] = {};
+        if (!GetEnvironmentVariableW(L"OPENFENCES_DIAG", diag, 8)) return;
+        wchar_t appdata[MAX_PATH] = {};
+        if (!GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH)) return;
+        std::wstring dir = std::wstring(appdata) + L"\\openFences";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        std::wstring p = dir + L"\\startup.log";
+        wcscpy_s(path, p.c_str());
+    }
+    FILE* f = _wfopen(path, L"a, ccs=UTF-8");
+    if (!f) return;
+    va_list ap; va_start(ap, fmt);
+    vfwprintf(f, fmt, ap);
+    va_end(ap);
+    fwprintf(f, L"\r\n");
+    fclose(f);
+}
 
 // nlohmann stores narrow strings as UTF-8; the app works in UTF-16.
 std::string ToUtf8(const std::wstring& w) {
@@ -81,6 +110,7 @@ json SaveFence(FenceWindow& f) {
 
 void LoadFence(const json& jf) {
     if (!jf.is_object()) return;
+    LoadLog(L"LoadFence begin");
     FenceData fd;
     fd.id    = FromUtf8(jf.value("id", std::string()));
     fd.title = FromUtf8(jf.value("title", std::string()));
@@ -90,7 +120,9 @@ void LoadFence(const json& jf) {
     fd.h     = jf.value("h", 0);
     if (fd.w < 40 || fd.h < 20) return;   // degenerate entry — skip
 
+    LoadLog(L"LoadFence ctor title=%s %dx%d", fd.title.c_str(), fd.w, fd.h);
     auto f = std::make_unique<FenceWindow>(fd);
+    LoadLog(L"LoadFence ctor done hwnd=%p", f->Hwnd());
     if (!f->Hwnd()) return;               // no desktop host right now
 
     // Appearance: restore exactly the fields the settings panel edits.
@@ -107,6 +139,7 @@ void LoadFence(const json& jf) {
             wcscpy_s(app.fontName, _countof(app.fontName), fn.c_str());
     }
     f->GetRender().RebuildStyles();
+    LoadLog(L"LoadFence appearance done");
 
     fd.sourceFolder = FromUtf8(jf.value("source", std::string()));
 
@@ -132,15 +165,19 @@ void LoadFence(const json& jf) {
                 icons.push_back(std::move(e));
             }
         }
+        LoadLog(L"LoadFence SetIcons n=%zu", icons.size());
         f->SetIcons(icons);
+        LoadLog(L"LoadFence RelayoutIcons");
         f->RelayoutIcons();
+        LoadLog(L"LoadFence RelayoutIcons done");
     }
 
     // Collapse LAST: while expanded the window still has its saved height,
     // so ToggleCollapse remembers the right m_expandedH.
     if (jf.value("collapsed", false)) f->ToggleCollapse();
-
+    LoadLog(L"LoadFence collapse done, pushing");
     g_fences.push_back(std::move(f));
+    LoadLog(L"LoadFence pushed");
 }
 
 } // namespace
@@ -162,6 +199,7 @@ bool SaveNow() {
     j["language"]   = FenceWindow::GetLanguage();
     j["hideAll"]    = g_allHidden;
     j["deskHidden"] = g_deskHidden;
+    j["showDesktopHotkey"] = ToUtf8(g_showDesktopHotkey);
     json fences = json::array();
     for (const auto& f : g_fences)
         fences.push_back(SaveFence(*f));
@@ -219,20 +257,34 @@ bool LoadApp() {
 
     int lang = j.value("language", 1);
     FenceWindow::SetLanguage(lang == 0 ? 0 : 1);
+    // Must be known before the fences are created: FenceWindow chooses its
+    // birth parent (DefView vs icon list) from this flag.
+    g_deskHidden = j.value("deskHidden", false);
+    g_showDesktopHotkey = FromUtf8(j.value("showDesktopHotkey",
+        ToUtf8(L"Ctrl+Alt+Home")));
+    if (g_showDesktopHotkey.empty()) g_showDesktopHotkey = L"Ctrl+Alt+Home";
 
+    LoadLog(L"LoadApp parsed, fences=%d", j.contains("fences") ? (int)j["fences"].size() : -1);
     if (j.contains("fences") && j["fences"].is_array())
         for (const auto& jf : j["fences"])
             LoadFence(jf);
+    LoadLog(L"LoadApp fences done");
 
     // An empty array is a legitimate state (the user deleted every fence) —
     // only a MISSING file triggers the defaults, so honor it.
     g_allHidden = j.value("hideAll", false);
     if (g_allHidden)
         for (auto& f : g_fences) f->Hide();
-    // The hide itself is replayed by main.cpp (ApplyDesktopIconsHidden) once
-    // the desktop tree is up — parking the fences needs its helpers.
-    g_deskHidden = j.value("deskHidden", false);
     return true;
+}
+
+const std::wstring& ShowDesktopHotkey() {
+    return g_showDesktopHotkey;
+}
+
+void SetShowDesktopHotkey(const std::wstring& combo) {
+    g_showDesktopHotkey = combo.empty() ? L"Ctrl+Alt+Home" : combo;
+    MarkDirty();
 }
 
 void RevealFile() {
